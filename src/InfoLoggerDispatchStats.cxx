@@ -29,6 +29,8 @@
 #include "ConfigInfoLoggerServer.h"
 #include "infoLoggerMessage.h"
 
+#define INDEX_SEPARATOR "_"
+
 using namespace std::chrono;
 
 ////////////////////////////////////////////////////////
@@ -90,7 +92,7 @@ InfoLoggerDispatchStats::InfoLoggerDispatchStats(ConfigInfoLoggerServer* config,
         return; // invalid index name
       }
       lix.push_back(i);
-      if (lix.size()>1) nix += "-";
+      if (lix.size()>1) nix += INDEX_SEPARATOR;
       nix += name;
     }
     dPtr->ilgFieldsToIndex.push_back(std::pair(std::move(nix), std::move(lix)));
@@ -234,7 +236,7 @@ int InfoLoggerDispatchStats::customMessageProcess(std::shared_ptr<InfoLoggerMess
 	      for (int ii = 0 ; ii < (int)dPtr->ilgFieldsToIndex[id].second.size(); ii++) {
 	        if (debug) {printf("  get [%d]\n",  dPtr->ilgFieldsToIndex[id].second[ii]);}
 	        if (ii) {
-		  v += "-";
+		  v += INDEX_SEPARATOR;
 		}
 		std::string fv = getStringValue(lmsg, dPtr->ilgFieldsToIndex[id].second[ii]);
 		if (debug) {printf("    = %s\n",fv.c_str());}
@@ -434,7 +436,14 @@ int InfoLoggerDispatchStats::customLoop()
     };
     
     std::string txt;
+    bool isFirst = 1;
     for (const auto& [timestamp, window] : dPtr->windows) {
+      if (isFirst) {
+        isFirst = 0;
+      } else {
+        txt += " ";
+      }
+
         //txt += "{ " + std::to_string(timestamp) +  " " + toTclList(window) + " }";
 	txt += toTclList(window);
     }
