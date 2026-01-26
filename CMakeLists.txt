@@ -446,6 +446,9 @@ endforeach()
 install(PROGRAMS src/infoBrowser.tcl DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME o2-infologger-browser)
 install(PROGRAMS src/infoLoggerTester.tcl DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME o2-infologger-tester)
 install(PROGRAMS newMysql.sh DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME o2-infologger-newdb)
+install(PROGRAMS src/o2-infologger-alert DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(PROGRAMS src/o2-infologger-httpd DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(PROGRAMS src/o2-infologger-status DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # service files
 set(SERVICE_SRCS infoLoggerD.service infoLoggerServer.service)
