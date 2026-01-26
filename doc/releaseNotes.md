@@ -185,3 +185,4 @@ This file describes the main feature changes for each InfoLogger released versio
 
 # next version
 - o2-infologger-httpd: inject log messages from HTTP request
+- o2-infologger-status: creates periodically a HTML report of recent messages received by infoLoggerServer

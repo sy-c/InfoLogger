@@ -1,0 +1,471 @@
+#!/usr/bin/tclsh
+
+# toolkit to process online stats coming from infoLoggerServer
+# v1.0.0   13/11/2025 - initial release
+
+set cfg(TelegrafSocket) "/tmp/telegraf.sock"
+set cfg(TelegrafBucket) "InfologgerStats"
+set cfg(RunWithoutDeps) 1
+set cfg(InfoLoggerConfigFile) "/etc/o2.d/infologger/infoLogger.cfg"
+set cfg(Debug) 0
+set cfg(LogFacility) "ilg/stats"
+set cfg(LoopTimeout) 5000
+
+####################
+
+set configFile $cfg(InfoLoggerConfigFile)
+
+catch {
+  set configFile $env(INFOLOGGER_CONFIG)
+}
+
+# process command line arguments (pre-init)
+set x 0
+while {[set opt [lindex $argv $x]] != ""} {
+ switch -exact -- $opt {
+   -z {
+        set configFile [lindex $argv [expr $x + 1]]
+        incr x   
+   }
+ }
+ incr x
+}
+
+
+####################
+
+
+# function to log on stdout
+proc doLog {msg} {
+    set t [clock format [clock seconds] -format "%d/%m/%Y %H:%M:%S"]
+    puts "$t\t$msg"
+}
+
+# function to log on InfoLogger
+proc doLogIlg {errcode msg} {
+  global logHandle
+  global logContext
+  if {$logHandle == ""} {
+    return
+  }
+  
+  $logHandle log $logContext "$msg"
+  doLog "$msg"
+}
+
+####################
+# check dependencies
+####################
+
+set dependenciesOk 1
+
+# try to load infoLogger library
+set defaultLevel 11
+set defaultSeverity "I"
+proc logResetFields {} {
+  global logHandle
+  if {$logHandle == ""} {return}
+  global logContext
+  global defaultLevel
+  global defaultSeverity
+  global cfg
+  $logContext setField "Facility" $cfg(LogFacility)
+  $logContext setField "System" "FLP"
+  $logContext setField "Level" "$defaultLevel"
+  $logContext setField "Severity" "$defaultSeverity"
+  $logContext setField "ErrorCode" ""
+  $logContext setField "Run" ""
+  $logContext setField "Partition" ""
+  $logContext setField "Detector" ""
+}
+
+if {[catch {
+  set logHandle ""
+  load /opt/o2-InfoLogger/lib/infoLoggerForTcl.so
+  set logHandle [InfoLogger]
+  set logContext [InfoLoggerMetadata]
+  logResetFields
+  #doLog "InfoLogger library enabled"
+} err]} {
+  doLog "Failed to init infoLogger library: $err"
+  set dependenciesOk 0
+}
+
+
+# socat
+if {[catch {exec socat -V} err]} {
+  doLog "Failed to find 'socat': $err"
+  set dependenciesOk 0
+}
+
+# telegraf
+if {![file exists $cfg(TelegrafSocket)]} {
+  doLog "Failed to find Telegraf socket $cfg(TelegrafSocket)"
+  set dependenciesOk 0
+}
+
+# configFile
+if {![file exists $configFile]} {
+  doLog "Failed to find InfoLogger configuration $configFile"
+  set dependenciesOk 0
+}
+
+# exit or continue
+if {(!$dependenciesOk)} {
+  if ($cfg(RunWithoutDeps)) {
+    doLog "Dependencies failed, but continue running"
+  } else {
+    doLog "Dependencies failed, exiting"
+    exit 1
+  }
+}
+
+########################
+# end check dependencies
+########################
+
+
+proc doLogBoth {msg} {
+  doLog "$msg"
+  doLogIlg "" "$msg"
+}
+
+
+doLog "Starting infoLoggerStatsReporter - pid [pid]"
+
+
+# Define online server timeouts (seconds)
+set onlineserver(retry) 5
+set onlineserver(max) 60
+set onlineserver(timeout) $onlineserver(retry)
+set onlineserver(timer) ""
+
+set defaultDir "/tmp"
+set infoDir ""
+set configName "\[default config\]"
+
+set default_db_user ""
+set default_db_pwd ""
+set default_db_host ""
+set default_db_db ""
+set default_loghost "localhost"
+set default_logport "6103"
+
+set configFileSection "\[infoStats\]"
+set configFileSectionFound 0
+if {$configFile!=""} {
+  set fd [open $configFile "r"]
+  set keyfound {}
+  while {1} {
+    gets $fd line
+    if {[eof $fd]} {break}
+    # remove leading/trailing blanks
+    set line [string trim $line]
+    if {$line==$configFileSection} {
+      # entering infoBrowser section
+      set configFileSectionFound 1
+    } elseif {[regexp {^\[.*\]} $line]} {
+      # entering another section
+      set configFileSectionFound 0
+    }
+    if {!$configFileSectionFound} {
+      continue
+    }
+    set lv [split [string trim $line] "="]
+    set lkey [lindex $lv 0]
+    if {[string range $lkey 0 1]=="#"} {continue}
+    set lv [string trim [join [lrange $lv 1 end] "="]]
+    
+    lappend keyfound $lkey
+    set cfgvals($lkey) $lv
+  }
+  close $fd
+  
+  set cfgok 1
+  foreach {keyname isoptionnal varname defval} [list \
+    serverHost 1 loghost "$default_loghost" \
+    serverPortStats 1 logport "$default_logport" \
+    configName 1 configName "$configFile" \
+  ] {
+    set $varname $defval
+    if {[catch { set $varname $cfgvals($keyname) }]} {   
+      if {!$isoptionnal} {
+        doLog "Configuration variable $keyname undefined"
+        set cfgok 0
+      }
+    }
+  }  
+  if {!$cfgok} {
+    doLog "Wrong configuration in $configFile, exiting"
+    exit -1
+  }
+  
+} else {
+
+  set envok 1
+  foreach {envname isoptionnal varname defval} [list \
+    INFOLOGGER_SERVER_HOST 1 loghost "${default_loghost}" \
+    INFOLOGGER_SERVER_PORT_STATS 1 logport "${default_logport}" \
+  ] {
+    set $varname $defval
+    if {[catch { set $varname $env($envname) }]} {      
+      if {!$isoptionnal} {
+        doLog "Environment variable $envname undefined"
+        set envok 0
+      }
+    }
+  }
+   
+  if {!$envok} {
+    doLog "Wrong environment, exiting"
+    exit -1
+  }
+}
+
+
+#################################
+# display online data
+#################################
+set server_fd -1
+
+# process an event on the socket
+proc server_event {} {
+  global cfg
+
+  global server_fd
+
+  fileevent $server_fd readable ""
+  set n_loop 0
+
+  while {1} {
+    
+    # connection closed?
+    if {[eof $server_fd]} {
+      close $server_fd
+      set server_fd -1
+      global onlineserver
+      doLog "Connection closed. Reconnecting in $onlineserver(timeout) seconds"
+      update
+      set onlineserver(timer) [after [expr $onlineserver(timeout)*1000] {server_connect}]
+      break
+    }
+
+    # read and decode message
+    if {[gets $server_fd data]==-1} {break}
+       
+    puts "rx: [string length $data]"
+    #puts "[string range $data 0 100]"
+    
+    if {1} {
+    set fixed ""
+    for {set i 0} {$i<[string length $data]} {incr i} {
+      set c [string index $data $i]
+      append fixed $c
+      if {$c == "\}"} {
+        catch {
+	if {[string index $data [expr $i + 1]] == "\{"} {
+          append fixed " "
+	}
+	}
+      }
+    }
+   set data $fixed
+   }
+   
+   
+   # Ensure the string is a proper list
+   set windows [list {*}$data]
+    
+   puts "number of windows: [llength $windows]"
+   
+   foreach w $windows {
+     foreach {k v} $w {   
+       set W($k) $v
+     }
+     puts "[clock format $W(timeBegin)] $W(totalMessages)"
+   }
+
+   break
+   
+   # Use only the last window
+   set lastWindow [lindex $windows 0]
+
+   # Convert to dict
+   dict for {k v} $lastWindow { 
+     puts "$k = $v"
+     set W($k) $v
+   }
+
+  puts "last window: [clock format $W(timeBegin)]"
+  puts "number of indexes: [llength $W(fieldCounts)]"
+
+   # Parse fieldCounts
+   array unset FC
+   dict for {fieldName counts} $W(fieldCounts) {
+       set FC($fieldName) {}
+
+       dict for {valueName count} $counts {
+         puts $valueName
+           lappend FC($fieldName) [list $valueName $count]
+       }
+   }
+
+# Determine the top-N (e.g. top 3) per field
+set hotTopics {}
+set N 3
+
+foreach field [array names FC] {
+    set pairs $FC($field)
+    # Sort descending by count
+    set sorted [lsort -index 1 -integer -decreasing $pairs]
+    set top [lrange $sorted 0 [expr {$N-1}]]
+    dict set hotTopics $field $top
+}
+      
+   
+   set html "<!DOCTYPE html>\n<html><head><meta charset=\"UTF-8\">\n"
+append html "<title>Status - Hot Topics</title>\n"
+append html "<style>\n"
+append html "body { font-family: sans-serif; }\n"
+append html "table { border-collapse: collapse; margin-bottom: 2em; }\n"
+append html "th, td { border: 1px solid #ccc; padding: 4px 8px; }\n"
+append html "</style>\n"
+append html "</head><body>\n"
+
+append html "<h1>Hot Topics</h1>\n"
+append html "<p>Window: [clock format $W(timeBegin)] - [clock format $W(timeEnd)]</p>\n"
+
+# Table for each field
+dict for {fieldName topics} $hotTopics {
+    append html "<h2>$fieldName</h2>\n"
+    append html "<table>\n<tr><th>Value</th><th>Count</th></tr>\n"
+
+    foreach pair $topics {
+        lassign $pair valueName count
+        append html "<tr><td>$valueName</td><td>$count</td></tr>\n"
+    }
+
+    append html "</table>\n"
+}
+
+append html "</body></html>"
+   
+   
+# Create HTML file
+set filename "report.html"
+set fh [open $filename w]
+puts $fh $html
+close $fh
+
+puts "* HTML report generated: $filename"
+   
+   
+   
+   
+  
+   
+   
+   
+   
+
+
+    incr n_loop
+    if {$n_loop==1000} {break}
+  }
+  
+  if {$server_fd!=-1} {  
+    fileevent $server_fd readable server_event
+  }
+}
+
+
+# open socket to data server
+proc server_connect {} {
+  global server_fd
+  global env
+  global onlineserver
+  
+  set onlinetimer(timer) ""
+    
+  # connect only if not connected yet
+  if {$server_fd!=-1} {return}
+
+  global loghost
+  global logport
+
+  doLog "Connecting $loghost ..."
+  update
+
+  # open socket
+  if {[catch {set server_fd [socket $loghost $logport]} err]} {
+    doLog "while connecting $loghost:$logport - $err. Will retry in $onlineserver(timeout) seconds"
+    set onlineserver(timer) [after [expr $onlineserver(timeout)*1000] {server_connect}]
+    if {$onlineserver(timeout)<$onlineserver(max)} {set onlineserver(timeout) [expr $onlineserver(timeout) * 2]}
+    update
+    return
+  }
+  set onlineserver(timeout) $onlineserver(retry)
+  fconfigure $server_fd -blocking false   
+  fconfigure $server_fd -buffersize 1000000
+  fileevent $server_fd readable server_event
+  
+  doLog "Connected"
+  
+  update
+}
+
+set online 1
+set busy 0
+
+proc doOnline {} {
+  global online
+  global server_fd
+
+  global busy
+  
+  if {$online} {
+
+    if {$busy} {return}
+    set busy 1
+
+    # Go Online
+
+    # update status display
+    doLog "Opening infoLoggerServer"
+    
+    # connect server
+    server_connect
+    
+    update
+    
+  } else {
+    # close server
+    if {$server_fd!=-1} {
+      close $server_fd
+      set server_fd -1
+    }
+
+    doLog "Closing infoLoggerServer"
+
+    global onlineserver
+    if {"$onlineserver(timer)"!=""} {
+      after cancel $onlineserver(timer)
+      set onlineserver(timer) ""
+    }
+    
+    update    
+    set busy 0
+  }
+}
+
+
+doOnline
+
+
+while {1} {
+  after $cfg(LoopTimeout) {set timeout 1}
+  vwait timeout
+  #doLog "loop"
+  set now [clock seconds]
+}
+
