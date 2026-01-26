@@ -1,0 +1,209 @@
+#!/usr/bin/tclsh
+
+# daemon to inject log messages from HTTP requests
+# example request: http://ali-staging:8084/log?Message=This+is+a+test+error&Facility=test&Severity=E
+#
+# open port:  firewall-cmd --zone=public --permanent --add-port=8084/tcp; firewall-cmd --reload
+# start daemon manually: [root@alio2-cr1-hv-mvs00 ~]# nohup /root/o2-infologger-httpd > /tmp/o2-infologger-httpd.log 2>&1 &
+
+# v1.0 03/07/2025 - initial release
+
+set cfg(RunWithoutDeps) 0
+set cfg(Debug) 0
+set cfg(HTTPPort) 8084
+
+set infoLoggerFields {Facility Role System Detector Partition Run Severity Level ErrorCode SourceFile SourceLine}
+
+
+####################
+
+
+# function to log on stdout
+proc doLog {msg} {
+    set t [clock format [clock seconds] -format "%d/%m/%Y %H:%M:%S"]
+    puts "$t\t$msg"
+}
+
+
+# function to log on stdout
+proc doLogDebug {msg} {
+    global cfg
+    if {!$cfg(Debug)} {return}
+    set t [clock format [clock seconds] -format "%d/%m/%Y %H:%M:%S"]
+    #puts "$t\t$msg"
+    puts "$msg"
+}
+
+
+# function to log on InfoLogger
+proc doLogIlg {errcode msg} {
+  global logHandle
+  global logContext
+  if {$logHandle == ""} {
+    return
+  }
+  
+  $logContext setField "ErrorCode" "$errcode"
+  $logHandle log $logContext "$msg"
+  doLog "$msg"
+  logResetFields
+}
+
+
+####################
+# check dependencies
+####################
+
+set dependenciesOk 1
+
+# try to load infoLogger library
+set defaultLevel 11
+set defaultSeverity "I"
+proc logResetFields {} {
+  global logHandle
+  global logContext
+  global defaultLevel
+  global defaultSeverity
+  $logContext setField "Facility" "ilg/httpd"
+  $logContext setField "System" "FLP"
+  $logContext setField "Level" "$defaultLevel"
+  $logContext setField "Severity" "$defaultSeverity"
+  $logContext setField "ErrorCode" ""
+}
+
+if {[catch {
+  set logHandle ""
+  load /opt/o2-InfoLogger/lib/infoLoggerForTcl.so
+  set logHandle [InfoLogger]
+  set logContext [InfoLoggerMetadata]
+  logResetFields
+} err]} {
+  doLog "Failed to init infoLogger library: $err"
+  set dependenciesOk 0
+}
+
+# exit or continue
+if {(!$dependenciesOk)} {
+  if ($cfg(RunWithoutDeps)) {
+    doLog "Dependencies failed, but continue running"
+  } else {
+    doLog "Dependencies failed, exiting"
+    exit 1
+  }
+}
+
+########################
+# end check dependencies
+########################
+
+
+doLog "Starting infoLogger HTTPD bridge - pid [pid]"
+
+
+# Procedure to handle incoming connections
+proc handle_connection {sock addr port} {
+    doLogDebug "Connection from $addr:$port"
+    fconfigure $sock -blocking 0 -buffering line
+    fileevent $sock readable [list read_request $sock]
+}
+
+# URL decode helper (converts %XX to character, + to space)
+proc urldecode {str} {
+    set str [string map {+ " "} $str]
+    set result ""
+    set i 0
+    while {$i < [string length $str]} {
+        if {[string index $str $i] eq "%"} {
+            set hex [string range $str [expr {$i+1}] [expr {$i+2}]]
+            append result [binary format c [scan $hex %x]]
+            incr i 3
+        } else {
+            append result [string index $str $i]
+            incr i
+        }
+    }
+    return $result
+}
+
+# Parse query parameters into a dict
+proc parse_query {query} {
+    set params {}
+    foreach pair [split $query "&"] {
+        if {[regexp {([^=]+)=?(.*)} $pair -> key value]} {
+            set key [urldecode $key]
+            set value [urldecode $value]
+            dict set params $key $value
+        }
+    }
+    return $params
+}
+
+# Request handling
+proc read_request {sock} {
+    if {[eof $sock]} {
+        close $sock
+        return
+    }
+
+    gets $sock line
+    doLogDebug "Received: $line"
+
+    # First line: GET /path?key=value HTTP/1.1
+    if {[regexp {^GET\s+([^?\s]+)\??([^ ]*)\s+HTTP/} $line -> path query]} {
+        doLogDebug "Requested path: $path"
+        if {$query ne ""} {
+            doLogDebug "Query string: $query"
+            set params [parse_query $query]
+            doLogDebug "Parsed parameters:"
+            foreach {key value} $params {
+                doLogDebug "  $key = $value"
+            }
+	    processQuery $path $params
+        }
+    }
+
+    # End of headers: empty line
+    if {[string trim $line] eq ""} {
+        # Send empty HTTP response
+        puts $sock "HTTP/1.1 200 OK\r"
+        puts $sock "Content-Length: 0\r"
+        puts $sock "Connection: close\r"
+        puts $sock "\r"
+        flush $sock
+        close $sock
+    }
+}
+
+
+# process queries
+proc processQuery {path params} {
+  # path is the path from HTTP request
+  # params is a dict with key/value pairs
+  if {$path == "/log"} {
+    global logHandle
+    if {$logHandle == ""} { return }
+    
+    if {[dict exists $params Message]} {
+      set msg [dict get $params Message]
+      
+      set logContext [InfoLoggerMetadata]
+      global infoLoggerFields
+      foreach key $infoLoggerFields {
+        if {[dict exists $params $key]} {
+	  set value [dict get $params $key]
+          $logContext setField $key $value
+	  doLog "$key = $value"
+        }
+      }
+      $logHandle log $logContext "$msg"
+      doLog "LOG: $msg"
+    }
+  }
+}
+
+
+
+# Start listening
+socket -server handle_connection $cfg(HTTPPort)
+doLog "Listening on port $cfg(HTTPPort)..."
+vwait forever
