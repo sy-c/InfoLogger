@@ -182,3 +182,6 @@ This file describes the main feature changes for each InfoLogger released versio
 - o2-infologger-alert service
 - o2-infologger-browser:
   - added some extra startup option, to preconfigure filters
+
+# next version
+- o2-infologger-httpd: inject log messages from HTTP request
