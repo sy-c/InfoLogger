@@ -1,0 +1,575 @@
+#!/usr/bin/tclsh
+
+# toolkit to process online messages and bridge them to external consumers
+# v1.0.0   02/03/2026 - initial release
+
+set cfg(RunWithoutDeps) 1
+set cfg(InfoLoggerConfigFile) "/etc/o2.d/infologger/infoLogger.cfg"
+set cfg(Debug) 0
+set cfg(LogFacility) "ilg/bridge"
+set cfg(syslogsocket) "/tmp/syslog.sock"
+
+
+####################
+
+set configFile $cfg(InfoLoggerConfigFile)
+
+catch {
+  set configFile $env(INFOLOGGER_CONFIG)
+}
+
+# process command line arguments (pre-init)
+set x 0
+while {[set opt [lindex $argv $x]] != ""} {
+ switch -exact -- $opt {
+   -z {
+        set configFile [lindex $argv [expr $x + 1]]
+        incr x   
+   }
+ }
+ incr x
+}
+
+
+####################
+
+
+# function to log on stdout
+proc doLog {msg} {
+    set t [clock format [clock seconds] -format "%d/%m/%Y %H:%M:%S"]
+    puts "$t\t$msg"
+}
+
+# function to log on InfoLogger
+proc doLogIlg {errcode msg} {
+  global logHandle
+  global logContext
+  if {$logHandle == ""} {
+    return
+  }
+  
+  $logHandle log $logContext "$msg"
+  doLog "$msg"
+}
+
+####################
+# check dependencies
+####################
+
+set dependenciesOk 1
+
+if {[catch {
+  set logHandle ""
+  load /opt/o2-InfoLogger/lib/infoLoggerForTcl.so
+  set logHandle [InfoLogger]
+  set logContext [InfoLoggerMetadata]
+} err]} {
+  doLog "Failed to init infoLogger library: $err"
+  set dependenciesOk 0
+}
+
+
+# socat
+if {[catch {exec socat -V} err]} {
+  doLog "Failed to find 'socat': $err"
+  set dependenciesOk 0
+}
+
+# configFile
+if {![file exists $configFile]} {
+  doLog "Failed to find InfoLogger configuration $configFile"
+  set dependenciesOk 0
+}
+
+# exit or continue
+if {(!$dependenciesOk)} {
+  if ($cfg(RunWithoutDeps)) {
+    doLog "Dependencies failed, but continue running"
+  } else {
+    doLog "Dependencies failed, exiting"
+    exit 1
+  }
+}
+
+########################
+# end check dependencies
+########################
+
+
+proc doLogBoth {msg} {
+  doLog "$msg"
+  doLogIlg "" "$msg"
+}
+
+
+
+
+doLog "Starting infoLogger bridge - pid [pid]"
+
+
+
+###############
+# internal vars
+
+set subsecond_decimal 3
+set subsecond_decimal_l 0
+
+# display message with configured log fields
+set log_fields {Severity Level Date Time Subsecond Host Role Pid Username System Facility Detector Partition Run ErrCode srcLine srcFile Message}
+
+# as defined in https://github.com/AliceO2Group/InfoLogger/blob/master/src/infoLoggerMessage.c
+set log_fields_p14 {severity level timestamp hostname rolename pid username system facility detector partition run errcode errline errsource message}
+
+
+# real protocol used
+# number of fields
+set log_protocol_nFields 16
+set log_protocol_version 1.4
+
+# One global for each field contains list of items - create empty
+foreach item $log_fields {
+  set log_val_$item {}
+}
+# highlight selected log, defined in global variable log_selected
+set n_msgs 0
+set n_msgs_bad 0
+
+
+
+
+
+# Define online server timeouts (seconds)
+set onlineserver(retry) 5
+set onlineserver(max) 60
+set onlineserver(timeout) $onlineserver(retry)
+set onlineserver(timer) ""
+
+set maxmess 10000
+
+
+
+set defaultDir "/tmp"
+set infoDir ""
+set configName "\[default config\]"
+
+set default_db_user ""
+set default_db_pwd ""
+set default_db_host ""
+set default_db_db ""
+set default_loghost "localhost"
+set default_logport "6102"
+
+set configFileSection "\[infoBrowser\]"
+set configFileSectionFound 0
+if {$configFile!=""} {
+  set fd [open $configFile "r"]
+  set keyfound {}
+  while {1} {
+    gets $fd line
+    if {[eof $fd]} {break}
+    # remove leading/trailing blanks
+    set line [string trim $line]
+    if {$line==$configFileSection} {
+      # entering infoBrowser section
+      set configFileSectionFound 1
+    } elseif {[regexp {^\[.*\]} $line]} {
+      # entering another section
+      set configFileSectionFound 0
+    }
+    if {!$configFileSectionFound} {
+      continue
+    }
+    set lv [split [string trim $line] "="]
+    set lkey [lindex $lv 0]
+    if {[string range $lkey 0 1]=="#"} {continue}
+    set lv [string trim [join [lrange $lv 1 end] "="]]
+    
+    lappend keyfound $lkey
+    set cfgvals($lkey) $lv
+  }
+  close $fd
+  
+  set cfgok 1
+  foreach {keyname isoptionnal varname defval} [list \
+    dbUser 0 db_user "$default_db_user" \
+    dbPassword 0 db_pwd "$default_db_pwd" \
+    dbHost 0 db_host "$default_db_host" \
+    dbName 0 db_db "$default_db_db" \
+    serverHost 1 loghost "$default_loghost" \
+    serverPortTx 1 logport "$default_logport" \
+    configName 1 configName "$configFile" \
+    queryLimit 1 maxmess "$maxmess" \
+  ] {
+    set $varname $defval
+    if {[catch { set $varname $cfgvals($keyname) }]} {   
+      if {!$isoptionnal} {
+        doLog "Configuration variable $keyname undefined"
+        set cfgok 0
+      }
+    }
+  }  
+  if {!$cfgok} {
+    doLog "Wrong configuration in $configFile, exiting"
+    exit -1
+  }
+  
+} else {
+
+  set envok 1
+  foreach {envname isoptionnal varname defval} [list \
+    INFOLOGGER_MYSQL_USER 1 db_user "$default_db_user" \
+    INFOLOGGER_MYSQL_PWD 1 db_pwd "$default_db_pwd" \
+    INFOLOGGER_MYSQL_HOST 1 db_host "$default_db_host" \
+    INFOLOGGER_MYSQL_DB 1 db_db "$default_db_db" \
+    INFOLOGGER_SERVER_HOST 1 loghost "${default_loghost}" \
+    INFOLOGGER_SERVER_PORT_TX 1 logport "${default_logport}" \
+  ] {
+    set $varname $defval
+    if {[catch { set $varname $env($envname) }]} {      
+      if {!$isoptionnal} {
+        doLog "Environment variable $envname undefined"
+        set envok 0
+      }
+    }
+  }
+   
+  if {!$envok} {
+    doLog "Wrong environment, exiting"
+    exit -1
+  }
+}
+
+
+
+
+#################################
+# display online data
+#################################
+set server_fd -1
+
+# process an event on the socket
+proc server_event {} {
+  global cfg
+
+  global server_fd
+  global n_msgs
+  global n_msgs_bad  
+
+  global log_fields
+  global log_protocol_nFields
+  global log_protocol_version
+
+  fileevent $server_fd readable ""
+  set n_loop 0
+  set n_msgs_start $n_msgs
+    
+  # init empty fields
+  foreach f $log_fields {
+    set l_$f {}
+  }
+    
+  while {1} {
+    
+    # connection closed?
+    if {[eof $server_fd]} {
+      close $server_fd
+      set server_fd -1
+      global onlineserver
+      doLog "Connection closed. Reconnecting in $onlineserver(timeout) seconds"
+      update
+      set onlineserver(timer) [after [expr $onlineserver(timeout)*1000] {server_connect}]
+      break
+    }
+
+    # read and decode message
+    if {[gets $server_fd msg]==-1} {break}
+       
+    while {1} {
+      set item [split $msg "#"]
+      if {[llength $item]<$log_protocol_nFields} {
+    	  incr n_msgs_bad
+	  break
+      }
+      set v1 [lindex $item 0]
+
+     if {$cfg(Debug)} {
+       puts "online msg=${msg}(end of msg)"
+     }
+
+      if {[string equal $v1 "*${log_protocol_version}"]} {
+
+        set v_severity [lindex $item 1]
+        set v_level [lindex $item 2]
+        set tmicro [lindex $item 3]
+        set v_hostname [lindex $item 4]
+        set v_rolename [lindex $item 5]  
+        set v_pid [lindex $item 6]
+        set v_username [lindex $item 7]
+        set v_system [lindex $item 8]
+        set v_facility [lindex $item 9]
+        set v_detector [lindex $item 10]
+        set v_partition [lindex $item 11]       
+        set v_run [lindex $item 12]
+        set v_errcode [lindex $item 13]
+        set v_errline [lindex $item 14]
+        set v_errsource [lindex $item 15]
+        set v_message [join [lrange $item 16 end] "#"]
+
+      } else {
+    	  incr n_msgs_bad
+	  break
+      }
+
+      global llmsg
+      incr llmsg [string length $msg]
+      #puts "** + [string length $msg] = $llmsg"
+      
+      set tval [expr int($tmicro)]
+
+      # re-format multiple line messages
+      foreach m [split $v_message "\f"] {
+
+      set field(Severity) "$v_severity"
+      set field(Timestamp) "$tval"
+      set field(Level) $v_level
+      set field(Host) $v_hostname
+      set field(Role) $v_rolename
+      set field(Pid) $v_pid
+      set field(Username) $v_username
+      set field(System) $v_system
+      set field(Facility) $v_facility
+      set field(Detector) $v_detector
+      set field(Partition) $v_partition
+      set field(ErrCode) $v_errcode
+      set field(srcLine) $v_errline
+      set field(srcFile) $v_errsource
+      set field(Run) $v_run
+      set field(Message) $m
+
+      # formatting
+      set ts1 [expr {int($tmicro)}]
+      set ts2 [expr {$tmicro - $ts1}]
+
+      # RFC 3339
+      set tss [join [list [clock format $ts1 -format "%Y-%m-%dT%H:%M:%S" -timezone :UTC]  [format "%06d" [expr {round($ts2 * 1e6)}]] "Z"] ""]
+      
+      # PRI
+      # local0 
+      # Fatal -> 2	Critical
+      # Error -> 3	Error
+      # Warning -> 4	Warning
+      # Info -> 6	Informational
+      # Debug -> 7	Debug
+      set syslog_facility 16
+      set syslog_level 6
+      if {$v_severity=="I"} {
+        set syslog_level 6
+      } elseif {$v_severity=="D"} {
+	set syslog_level 7
+      } elseif {$v_severity=="W"} {
+        set syslog_level 4
+      } elseif {$v_severity=="E"} {
+        set syslog_level 3
+      } elseif {$v_severity=="F"} {
+        set syslog_level 2
+      } else {
+        set syslog_level 6
+      }
+            
+      #check NIL values
+      if {$v_hostname == ""} {set v_hostname "-"}
+      if {$v_pid == ""} {set v_pid "-"}
+      
+      lset item 16 $m
+      
+      set d {}
+      global log_fields_p14
+      foreach k $log_fields_p14 v [lrange $item 1 16] {
+         if {[string length $v] == 0} {
+             set v "null"
+	     #lappend d "\"$k\": $v"
+	 } else {
+             set v "\"[json_escape $v]\""
+	     lappend d "\"$k\": $v"
+	 }
+      }
+      set json [join $d ", "]
+      
+      set syslogm "<[expr $syslog_facility * 8 +$syslog_level]>1 $tss $v_hostname o2-infologger $v_pid - - {$json}"
+      #puts $msg
+      #puts $syslogm
+      global llout
+      incr llout [string length $syslogm]
+      #puts "[string length $syslogm] - [string length $msg]"
+      sendmsg $syslogm
+      
+      incr n_msgs
+      }
+      break
+    }
+    
+    incr n_loop
+    if {$n_loop==1000} {break}
+  }
+ 
+  if {$server_fd!=-1} {  
+    fileevent $server_fd readable server_event
+  }
+}
+
+
+# open socket to data server
+proc server_connect {} {
+  global server_fd
+  global env
+  global onlineserver
+  
+  set onlinetimer(timer) ""
+    
+  # connect only if not connected yet
+  if {$server_fd!=-1} {return}
+
+  global loghost
+  global logport
+
+  doLog "Connecting $loghost ..."
+  update
+
+  # open socket
+  if {[catch {set server_fd [socket $loghost $logport]} err]} {
+    doLog "while connecting $loghost:$logport - $err. Will retry in $onlineserver(timeout) seconds"
+    set onlineserver(timer) [after [expr $onlineserver(timeout)*1000] {server_connect}]
+    if {$onlineserver(timeout)<$onlineserver(max)} {set onlineserver(timeout) [expr $onlineserver(timeout) * 2]}
+    update
+    return
+  }
+  set onlineserver(timeout) $onlineserver(retry)
+  fconfigure $server_fd -blocking false   
+  fconfigure $server_fd -buffersize 1000000
+  fileevent $server_fd readable server_event
+  
+  doLog "Connected"
+  
+  update
+}
+
+
+set online 1
+set busy 0
+
+proc doOnline {} {
+  global online
+  global server_fd
+
+  global busy
+  
+  if {$online} {
+
+    if {$busy} {return}
+    set busy 1
+
+    # Go Online
+
+    # update status display
+    doLog "Opening infoLoggerServer"
+    
+    # connect server
+    server_connect   
+    update
+    
+  } else {
+    # close server
+    if {$server_fd!=-1} {
+      close $server_fd
+      set server_fd -1
+    }
+
+    doLog "Closing infoLoggerServer"
+
+    global onlineserver
+    if {"$onlineserver(timer)"!=""} {
+      after cancel $onlineserver(timer)
+      set onlineserver(timer) ""
+    }
+    
+    update    
+    set busy 0
+  }
+}
+
+
+# test RX: socat -v UNIX-LISTEN:/tmp/syslog.sock,fork -
+set externalFd ""
+proc txconnect {} {
+  global externalFd
+  global cfg
+
+  if {$externalFd != ""} {
+    return
+  }
+  
+  doLog "Connect $cfg(syslogsocket)"
+  set externalFd [open "|socat - UNIX-CONNECT:$cfg(syslogsocket)" "w"]
+  if {[eof $externalFd]} {
+    close $externalFd
+    set externalFd ""
+  }
+}
+
+
+proc sendmsg {m} {
+  global externalFd
+  if {$externalFd == ""} {
+    return
+  }
+  if {[catch {     
+    puts $externalFd $m
+    flush $externalFd
+  } err] } {
+    doLog "Sending failed: $err"
+    catch {close $externalFd}
+    set externalFd ""
+  }
+}
+
+
+proc json_escape {str} {
+    set str [string map {
+        "\\" "\\\\"
+        "\"" "\\\""
+        "\b" "\\b"
+        "\f" "\\f"
+        "\n" "\\n"
+        "\r" "\\r"
+        "\t" "\\t"
+    } $str]
+
+    regsub -all {[\x00-\x1f]} $str {
+        format "\\u%04X" [scan "&" %c]
+    } str
+
+    return $str
+}
+
+doOnline
+
+set loopTimeout 5000
+set countMessagesLast 0
+set llmsg 0
+set llout 0
+while {1} {
+  txconnect
+  after $loopTimeout {set timeout 1}
+  vwait timeout
+  set nnew [expr $n_msgs - $countMessagesLast]
+  if {$llmsg} {
+    set llexp [expr $llout * 1.0 / $llmsg]
+  } else {
+    set llexp 0.0
+  }
+  #puts "* $llout <> $llmsg"
+  set llout 0
+  set llmsg 0
+  doLog "$nnew new messages, [expr $nnew / ($loopTimeout / 1000.0)] msg/s, expansion ratio $llexp"
+  set countMessagesLast $n_msgs
+}
