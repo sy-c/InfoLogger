@@ -351,7 +351,7 @@ proc server_event {} {
       set ts2 [expr {$tmicro - $ts1}]
 
       # RFC 3339
-      set tss [join [list [clock format $ts1 -format "%Y-%m-%dT%H:%M:%S" -timezone :UTC]  [format "%06d" [expr {round($ts2 * 1e6)}]] "Z"] ""]
+      set tss [join [list [clock format $ts1 -format "%Y-%m-%dT%H:%M:%S" -timezone :UTC]  [format ".%06d" [expr {round($ts2 * 1e6)}]] "Z"] ""]
       
       # PRI
       # local0 
