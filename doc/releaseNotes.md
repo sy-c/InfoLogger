@@ -185,4 +185,7 @@ This file describes the main feature changes for each InfoLogger released versio
 
 # v2.10.0 - 26/1/2026
 - o2-infologger-httpd: inject log messages from HTTP request
-- o2-infologger-status: creates periodically a HTML report of recent messages received by infoLoggerServer
+- o2-infologger-stats: creates periodically a HTML report of recent messages received by infoLoggerServer
+
+# v2.10.1 - 5/3/2026
+- o2-infologger-bridge: script to push online messages from o2-infologger-server to a local stream socket, with a syslog message formatting + JSON.
